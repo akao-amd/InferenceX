@@ -176,6 +176,61 @@ if [ "${RUN_EVAL}" = "true" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# CSV summary: benchmark_profile, throughput_per_gpu, interactivity
+#
+# Reads every <profile_tag>.json written to WORKSPACE and computes:
+#   throughput_per_gpu = output_throughput / TP   (output tok/s/GPU)
+#   interactivity      = 1000 / mean_tpot_ms      (tok/s/user, i.e. 1/TPOT_s)
+# ---------------------------------------------------------------------------
+set +x
+CSV_OUT="${WORKSPACE}/benchmark_summary.csv"
+python3 - <<PYEOF
+import json, os, glob, csv, sys
+
+workspace = "${WORKSPACE}"
+tp        = int("${TP}")
+patterns  = [
+$(for isl in $ISL_LIST; do
+    for osl in $OSL_LIST; do
+        for conc in $CONC_LIST; do
+            tag="kimik2i0905_${PRECISION}_I${isl}_O${osl}_C${conc}_sglang"
+            echo "    \"${tag}\","
+        done
+    done
+done)
+]
+
+rows = []
+for tag in patterns:
+    path = os.path.join(workspace, f"{tag}.json")
+    if not os.path.exists(path):
+        print(f"[csv] WARNING: {path} not found, skipping.", file=sys.stderr)
+        continue
+    with open(path) as f:
+        d = json.load(f)
+    output_tput   = float(d.get("output_throughput", 0))
+    mean_tpot_ms  = float(d.get("mean_tpot_ms", 0))
+    tput_per_gpu  = output_tput / tp if tp > 0 else 0
+    interactivity = 1000.0 / mean_tpot_ms if mean_tpot_ms > 0 else 0
+    rows.append({
+        "benchmark_profile":   tag,
+        "throughput_per_gpu":  f"{tput_per_gpu:.4f}",
+        "interactivity":       f"{interactivity:.4f}",
+    })
+
+out = "${CSV_OUT}"
+with open(out, "w", newline="") as f:
+    writer = csv.DictWriter(f, fieldnames=["benchmark_profile", "throughput_per_gpu", "interactivity"])
+    writer.writeheader()
+    writer.writerows(rows)
+
+print(f"[csv] Written {len(rows)} rows to {out}")
+for r in rows:
+    print(f"  {r['benchmark_profile']}: tput/gpu={r['throughput_per_gpu']} tok/s, interactivity={r['interactivity']} tok/s/user")
+PYEOF
+set -x
+
+# ---------------------------------------------------------------------------
 # Server teardown — skipped when --keep-server-alive or --benchmark-only
 # ---------------------------------------------------------------------------
 if [[ "$KEEP_SERVER_ALIVE" == "false" && "$BENCHMARK_ONLY" == "false" ]]; then
