@@ -16,6 +16,30 @@ export OSL=1024
 export RANDOM_RANGE_RATIO=1.0
 export RESULT_FILENAME="kimik2i0905_fp16_I1K_O1K_C64_sglang"
 
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+KEEP_SERVER_ALIVE=false
+BENCHMARK_ONLY=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --keep-server-alive)
+            KEEP_SERVER_ALIVE=true
+            shift
+            ;;
+        --benchmark-only)
+            BENCHMARK_ONLY=true
+            shift
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            echo "Usage: $0 [--keep-server-alive] [--benchmark-only]"
+            exit 1
+            ;;
+    esac
+done
+
 check_env_vars \
     MODEL \
     PRECISION \
@@ -53,47 +77,57 @@ NAME="akao_kimik2_sglang_server"
 
 set -x
 
-docker run --rm -d \
-    --name "${NAME}" \
-    --device=/dev/kfd \
-    --device=/dev/dri \
-    --group-add video \
-    --cap-add=SYS_PTRACE \
-    --security-opt seccomp=unconfined \
-    --ipc=host \
-    --network=host \
-    -v "${WORKSPACE}/:/workspace/" \
-    -v "${HF_HUB_CACHE}:${HF_HUB_CACHE}" \
-    -e HF_HOME="${HF_HOME}" \
-    -e HF_HUB_CACHE="${HF_HUB_CACHE}" \
-    -e RCCL_MSCCL_ENABLE \
-    -e SGLANG_USE_AITER=1 \
-    -e PYTHONPATH="/sgl-workspace/aiter" \
-    -e SGLANG_ROCM_FUSED_DECODE_MLA=0 \
-    "${IMAGE}" \
-    bash -lc "\
-        python -m sglang.launch_server \
-        --decode-attention-backend triton \
-        --prefill-attention-backend aiter \
-        --model-path "${MODEL}" \
-        --host 0.0.0.0 \
-        --port "${PORT}" \
-        --tensor-parallel-size "${TP}" \
-        --trust-remote-code \
-        --chunked-prefill-size 131072 \
-        --mem-fraction-static 0.95 \
-        --disable-radix-cache \
-        --num-continuous-decode-steps 4 \
-        --cuda-graph-max-bs "${CONC}" \
-	 --reasoning-parser kimi_k2 --tool-call-parser kimi_k2 \
-        ${QUANTIZATION_ARGS} > "${IN_SERVER_LOG}" 2>&1"
+# ---------------------------------------------------------------------------
+# Server launch — skipped in --benchmark-only mode
+# ---------------------------------------------------------------------------
+if [[ "$BENCHMARK_ONLY" == "false" ]]; then
+    docker run --rm -d \
+        --name "${NAME}" \
+        --device=/dev/kfd \
+        --device=/dev/dri \
+        --group-add video \
+        --cap-add=SYS_PTRACE \
+        --security-opt seccomp=unconfined \
+        --ipc=host \
+        --network=host \
+        -v "${WORKSPACE}/:/workspace/" \
+        -v "${HF_HUB_CACHE}:${HF_HUB_CACHE}" \
+        -e HF_HOME="${HF_HOME}" \
+        -e HF_HUB_CACHE="${HF_HUB_CACHE}" \
+        -e RCCL_MSCCL_ENABLE \
+        -e SGLANG_USE_AITER=1 \
+        -e PYTHONPATH="/sgl-workspace/aiter" \
+        -e SGLANG_ROCM_FUSED_DECODE_MLA=0 \
+        "${IMAGE}" \
+        bash -lc "\
+            python -m sglang.launch_server \
+            --decode-attention-backend triton \
+            --prefill-attention-backend aiter \
+            --model-path "${MODEL}" \
+            --host 0.0.0.0 \
+            --port "${PORT}" \
+            --tensor-parallel-size "${TP}" \
+            --trust-remote-code \
+            --chunked-prefill-size 131072 \
+            --mem-fraction-static 0.95 \
+            --disable-radix-cache \
+            --num-continuous-decode-steps 4 \
+            --cuda-graph-max-bs "${CONC}" \
+	     --reasoning-parser kimi_k2 --tool-call-parser kimi_k2 \
+            ${QUANTIZATION_ARGS} > "${IN_SERVER_LOG}" 2>&1"
 
-sleep 3
-SERVER_PID=$(docker inspect -f '{{.State.Pid}}' ${NAME})
+    sleep 3
+    SERVER_PID=$(docker inspect -f '{{.State.Pid}}' ${NAME})
 
-# Wait for server to be ready
-wait_for_server_ready --port "${PORT}" --server-log "${OUT_SERVER_LOG}" --server-pid "${SERVER_PID}"
+    # Wait for server to be ready
+    wait_for_server_ready --port "${PORT}" --server-log "${OUT_SERVER_LOG}" --server-pid "${SERVER_PID}"
+else
+    echo "[benchmark-only] Skipping server launch; assuming server is already running on port ${PORT}."
+fi
 
+# ---------------------------------------------------------------------------
+# Benchmark
+# ---------------------------------------------------------------------------
 docker exec -it "${NAME}" \
     bash -lc "source /workspace/benchmarks/benchmark_lib.sh; \
     run_benchmark_serving \
@@ -116,6 +150,13 @@ if [ "${RUN_EVAL}" = "true" ]; then
     append_lm_eval_summary
 fi
 
-docker stop ${NAME}
+# ---------------------------------------------------------------------------
+# Server teardown — skipped when --keep-server-alive or --benchmark-only
+# ---------------------------------------------------------------------------
+if [[ "$KEEP_SERVER_ALIVE" == "false" && "$BENCHMARK_ONLY" == "false" ]]; then
+    docker stop ${NAME}
+else
+    echo "[keep-server-alive] Container '${NAME}' left running."
+fi
 
 set +x
