@@ -150,7 +150,10 @@ for isl in $ISL_LIST; do
             profile_tag="kimik2i0905_${PRECISION}_I${isl}_O${osl}_C${conc}_sglang"
             echo ">>> Benchmarking profile: ${profile_tag}"
 
-            docker exec -it "${NAME}" \
+            # No -t: avoids TTY/SIGHUP disconnection killing long benchmarks.
+            # Benchmark output is tee'd to a per-profile log in WORKSPACE.
+            BENCH_LOG="${WORKSPACE}/${profile_tag}_bench.log"
+            docker exec "${NAME}" \
                 bash -lc "source /workspace/benchmarks/benchmark_lib.sh; \
                 run_benchmark_serving \
                 --model "${MODEL}" \
@@ -164,7 +167,7 @@ for isl in $ISL_LIST; do
                 --result-filename "${profile_tag}" \
                 --result-dir /workspace \
                 --bench-serving-dir /workspace \
-                --trust-remote-code"
+                --trust-remote-code" 2>&1 | tee "${BENCH_LOG}"
         done
     done
 done
