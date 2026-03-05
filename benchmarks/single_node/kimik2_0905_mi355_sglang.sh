@@ -10,11 +10,20 @@ export MODEL="/huggingface/hub/models--moonshotai--Kimi-K2-Instruct-0905/snapsho
 export PRECISION="bf16"
 export IMAGE="rocm/sgl-dev:v0.5.9-rocm720-mi35x-20260303"
 export TP=8
-export CONC=64
-export ISL=1024
-export OSL=1024
 export RANDOM_RANGE_RATIO=1.0
-export RESULT_FILENAME="kimik2i0905_fp16_I1K_O1K_C64_sglang"
+
+# ---------------------------------------------------------------------------
+# Default sweep dimensions — override via env vars or by editing these lines.
+#
+# Single value: ISL=1024 OSL=1024 CONC=64  (legacy / single-profile mode)
+# Multiple values (space-separated lists, takes Cartesian product):
+#   ISL_LIST="512 1024 2048"
+#   OSL_LIST="256 1024"
+#   CONC_LIST="32 64 128"
+# ---------------------------------------------------------------------------
+ISL_LIST="${ISL_LIST:-${ISL:-1024}}"
+OSL_LIST="${OSL_LIST:-${OSL:-1024}}"
+CONC_LIST="${CONC_LIST:-${CONC:-64}}"
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -44,11 +53,7 @@ check_env_vars \
     MODEL \
     PRECISION \
     TP \
-    CONC \
-    ISL \
-    OSL \
     RANDOM_RANGE_RATIO \
-    RESULT_FILENAME \
     IMAGE
 
 if [[ -n "$SLURM_JOB_ID" ]]; then
@@ -74,6 +79,15 @@ WORKSPACE="${GITHUB_WORKSPACE:-$(pwd)}"
 OUT_SERVER_LOG=${WORKSPACE}/server.log
 IN_SERVER_LOG=/workspace/server.log
 NAME="akao_kimik2_sglang_server"
+
+# ---------------------------------------------------------------------------
+# Derive max CONC across all sweep values (used for --cuda-graph-max-bs so
+# every combination can be benchmarked without restarting the server).
+# ---------------------------------------------------------------------------
+MAX_CONC=0
+for _c in $CONC_LIST; do
+    (( _c > MAX_CONC )) && MAX_CONC=$_c
+done
 
 set -x
 
@@ -112,7 +126,7 @@ if [[ "$BENCHMARK_ONLY" == "false" ]]; then
             --mem-fraction-static 0.95 \
             --disable-radix-cache \
             --num-continuous-decode-steps 4 \
-            --cuda-graph-max-bs "${CONC}" \
+            --cuda-graph-max-bs "${MAX_CONC}" \
 	     --reasoning-parser kimi_k2 --tool-call-parser kimi_k2 \
             ${QUANTIZATION_ARGS} > "${IN_SERVER_LOG}" 2>&1"
 
@@ -126,27 +140,38 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Benchmark
+# Benchmark sweep over all (ISL, OSL, CONC) combinations
 # ---------------------------------------------------------------------------
-docker exec -it "${NAME}" \
-    bash -lc "source /workspace/benchmarks/benchmark_lib.sh; \
-    run_benchmark_serving \
-    --model "${MODEL}" \
-    --port "${PORT}" \
-    --backend vllm \
-    --input-len "${ISL}" \
-    --output-len "${OSL}" \
-    --random-range-ratio "${RANDOM_RANGE_RATIO}" \
-    --num-prompts "$((CONC * 10))" \
-    --max-concurrency "${CONC}" \
-    --result-filename "${RESULT_FILENAME}" \
-    --result-dir /workspace \
-    --bench-serving-dir /workspace \
-    --trust-remote-code"
+for isl in $ISL_LIST; do
+    for osl in $OSL_LIST; do
+        for conc in $CONC_LIST; do
+            # Auto-derive a descriptive result filename for each combination.
+            # Format: kimik2i0905_<precision>_I<isl>_O<osl>_C<conc>_sglang
+            profile_tag="kimik2i0905_${PRECISION}_I${isl}_O${osl}_C${conc}_sglang"
+            echo ">>> Benchmarking profile: ${profile_tag}"
 
-# After throughput, run evaluation only if RUN_EVAL is true
+            docker exec -it "${NAME}" \
+                bash -lc "source /workspace/benchmarks/benchmark_lib.sh; \
+                run_benchmark_serving \
+                --model "${MODEL}" \
+                --port "${PORT}" \
+                --backend vllm \
+                --input-len "${isl}" \
+                --output-len "${osl}" \
+                --random-range-ratio "${RANDOM_RANGE_RATIO}" \
+                --num-prompts "$((conc * 10))" \
+                --max-concurrency "${conc}" \
+                --result-filename "${profile_tag}" \
+                --result-dir /workspace \
+                --bench-serving-dir /workspace \
+                --trust-remote-code"
+        done
+    done
+done
+
+# After throughput, run evaluation only if RUN_EVAL is true (uses last profile's CONC)
 if [ "${RUN_EVAL}" = "true" ]; then
-    run_eval --framework lm-eval --port "${PORT}" --concurrent-requests "${CONC}"
+    run_eval --framework lm-eval --port "${PORT}" --concurrent-requests "${MAX_CONC}"
     append_lm_eval_summary
 fi
 
